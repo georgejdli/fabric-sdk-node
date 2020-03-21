@@ -480,7 +480,14 @@ class ChannelEventHub {
 			this._stream = this._event_client.deliver();
 		}
 
-		this._stream.on('data', (deliverResponse) => {
+		this._stream.on('data', async (deliverResponse) => {
+			// pause the stream so callback can do async processing
+			// otherwise multiple events will trigger multi callback invocations
+			// before the previous one finishes
+			// Required if you need to process block events sequentially
+			// Also required if your Checkpointer (FileSystem or custom) uses async functions
+			// otherwise you risk the checkpoint being updated out of order and having a stale checkpoint
+			this._stream.pause();
 			if (self._connect_running) {
 				self._connect_running = false;
 				clearTimeout(connection_setup_timeout);
@@ -517,7 +524,8 @@ class ChannelEventHub {
 					logger.debug('on.data - incoming block number %s', self._last_block_seen);
 
 					// somebody may have registered to receive this block
-					self._processBlockEvents(block);
+					// These should be async functions
+					await self._processBlockEvents(block);
 					self._processTxEvents(block);
 					self._processChaincodeEvents(block);
 
@@ -549,6 +557,9 @@ class ChannelEventHub {
 				logger.debug('on.data - unknown deliverResponse');
 				logger.error('ChannelEventHub has received and unknown message type %s', deliverResponse.Type);
 			}
+
+			//resume the stream to get the next block
+			this._stream.resume();
 		});
 
 		this._stream.on('status', (response) => {
@@ -1402,17 +1413,18 @@ class ChannelEventHub {
 	 * private internal method for processing block events
 	 * @param {Object} block protobuf object
 	 */
-	_processBlockEvents(block) {
+	async _processBlockEvents(block) {
 		if (Object.keys(this._blockRegistrations).length === 0) {
 			logger.debug('_processBlockEvents - no registered block event "listeners"');
 			return;
 		}
 
 		// send to all registered block listeners
-		Object.keys(this._blockRegistrations).forEach((key) => {
+		// use Promise.all() to insure all listeners complete before moving on to the next block
+		await Promise.all(Object.keys(this._blockRegistrations).map(async (key) => {
 			const block_reg = this._blockRegistrations[key];
 			logger.debug('_processBlockEvents - calling block listener callback');
-			block_reg.onEvent(block);
+			await block_reg.onEvent(block);
 
 			// check to see if we should automatically unregister or/and disconnect this hub
 			if (block_reg.unregister) {
@@ -1423,7 +1435,7 @@ class ChannelEventHub {
 				logger.debug('_processBlockEvents - automatically disconnect');
 				this._disconnect(new EventHubDisconnectError('Shutdown due to disconnect on block registration'));
 			}
-		});
+		}));
 	}
 
 	/*
@@ -1783,9 +1795,9 @@ class EventRegistration {
 		}
 	}
 
-	onEvent(...args) {
+	async onEvent(...args) {
 		try {
-			this._onEventFn(...args);
+			await this._onEventFn(...args);
 		} catch (error) {
 			logger.warn('Event notification callback failed', error);
 		}
